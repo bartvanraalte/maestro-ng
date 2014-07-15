@@ -2,12 +2,19 @@
 #
 # Docker container orchestration utility.
 
+import bgtunnel
 import docker
+try:
+    from docker.errors import APIError
+except ImportError:
+    # Fall back to <= 0.3.1 location
+    from docker.client import APIError
+import multiprocessing.pool
 import re
-import socket
-import time
+import six
 
 from . import exceptions
+from . import lifecycle
 
 
 class Entity:
@@ -37,19 +44,43 @@ class Ship(Entity):
     DEFAULT_DOCKER_TIMEOUT = 5
 
     def __init__(self, name, ip, docker_port=DEFAULT_DOCKER_PORT,
-                 timeout=None):
+                 timeout=None, ssh_tunnel=None):
         """Instantiate a new ship.
 
         Args:
             name (string): the name of the ship.
             ip (string): the IP address of resolvable host name of the host.
             docker_port (int): the port the Docker daemon listens on.
+            ssh_tunnel (dict): configuration for SSH tunneling to the remote
+                Docker daemon.
         """
         Entity.__init__(self, name)
         self._ip = ip
         self._docker_port = docker_port
+        self._tunnel = None
 
-        self._backend_url = 'http://{:s}:{:d}'.format(ip, docker_port)
+        if ssh_tunnel:
+            if 'user' not in ssh_tunnel:
+                raise exceptions.EnvironmentConfigurationException(
+                    'Missing SSH user for ship {} tunnel configuration'.format(
+                        self.name))
+            if 'key' not in ssh_tunnel:
+                raise exceptions.EnvironmentConfigurationException(
+                    'Missing SSH key for ship {} tunnel configuration'.format(
+                        self.name))
+
+            self._tunnel = bgtunnel.open(
+                ssh_address=ip,
+                ssh_user=ssh_tunnel['user'],
+                ssh_port=int(ssh_tunnel.get('port', 22)),
+                host_port=docker_port,
+                silent=True,
+                identity_file=ssh_tunnel['key'])
+            self._backend_url = 'http://localhost:{}'.format(
+                self._tunnel.bind_port)
+        else:
+            self._backend_url = 'http://{:s}:{:d}'.format(ip, docker_port)
+
         self._backend = docker.Client(
             base_url=self._backend_url,
             version=Ship.DEFAULT_DOCKER_VERSION,
@@ -67,12 +98,18 @@ class Ship(Entity):
         return self._backend
 
     @property
-    def docker_endpoint(self):
-        """Returns the Docker daemon endpoint location on that ship."""
-        return 'tcp://%s:%d' % (self._ip, self._docker_port)
+    def address(self):
+        if self._tunnel:
+            return '{} (ssh:{})'.format(self.name, self._tunnel.bind_port)
+        return self.name
 
     def __repr__(self):
-        return '<ship:%s [%s:%d]>' % (self.name, self._ip, self._docker_port)
+        if self._tunnel:
+            return '<ship:{} ssh://{}@{}:{}->{}>'.format(
+                self.name, self._tunnel.ssh_user, self._ip,
+                self._tunnel.bind_port, self._docker_port)
+        return '<ship:{} http://{}:{}>'.format(
+            self.name, self._ip, self._docker_port)
 
 
 class Service(Entity):
@@ -102,6 +139,7 @@ class Service(Entity):
         self._image = image
         self.env = env or {}
         self._requires = set([])
+        self._wants_info = set([])
         self._needed_for = set([])
         self._containers = {}
 
@@ -120,7 +158,14 @@ class Service(Entity):
         its repository name and the requested tag (defaulting to latest if not
         specified)."""
         p = self._image.rsplit(':', 1)
+        if len(p) > 1 and '/' in p[1]:
+            p[0] = self._image
+            p.pop()
         return {'repository': p[0], 'tag': len(p) > 1 and p[1] or 'latest'}
+
+    @property
+    def dependencies(self):
+        return self._requires
 
     @property
     def requires(self):
@@ -130,6 +175,12 @@ class Service(Entity):
         for dep in dependencies:
             dependencies = dependencies.union(dep.requires)
         return dependencies
+
+    @property
+    def wants_info(self):
+        """Returns the full set of "soft" dependencies this service wants
+        information about through link environment variables."""
+        return self._wants_info
 
     @property
     def needed_for(self):
@@ -155,25 +206,27 @@ class Service(Entity):
         """Declare that the passed service depends on this service."""
         self._needed_for.add(service)
 
+    def add_wants_info(self, service):
+        """Declare that this service wants information about the passed service
+        via link environment variables."""
+        self._wants_info.add(service)
+
     def register_container(self, container):
         """Register a new instance container as part of this service."""
         self._containers[container.name] = container
 
     def get_link_variables(self, add_internal=False):
         """Return the dictionary of all link variables from each container of
-        this service."""
-        return dict(reduce(
-            lambda x, y: x+y,
-            map(lambda c: c.get_link_variables(add_internal).items(),
-                self._containers.values())))
-
-    def ping(self, retries=1):
-        """Check if this service is running, that is if all of its containers
-        are up and running."""
-        for container in self._containers.itervalues():
-            if not container.ping(retries):
-                return False
-        return True
+        this service. An additional variable, named '<service_name>_INSTANCES',
+        contain the list of container/instance names of the service."""
+        basename = re.sub(r'[^\w]', '_', self.name).upper()
+        links = {}
+        for c in self._containers.values():
+            for name, value in c.get_link_variables(add_internal).items():
+                links['{}_{}'.format(basename, name)] = value
+        links['{}_INSTANCES'.format(basename)] = \
+            ','.join(self._containers.keys())
+        return links
 
 
 class Container(Entity):
@@ -200,6 +253,9 @@ class Container(Entity):
         # Register this instance container as being part of its parent service.
         self._service.register_container(self)
 
+        # Get command
+        self.cmd = config.get('cmd', None)
+
         # Parse the port specs.
         self.ports = self._parse_ports(config.get('ports', {}))
 
@@ -221,12 +277,35 @@ class Container(Entity):
             (src or dst, dst) for dst, src in
             config.get('volumes', {}).items())
 
+        # Should this container run with -privileged?
+        self.privileged = config.get('privileged', False)
+
+        # Stop timeout
+        self.stop_timeout = config.get('stop_timeout', 10)
+
+        # Get limits
+        limits = config.get('limits', {})
+        self.cpu_shares = limits.get('cpu')
+        self.mem_limit = limits.get('memory')
+        if isinstance(self.mem_limit, six.string_types):
+            units = {'k': 1024,
+                     'm': 1024*1024,
+                     'g': 1024*1024*1024}
+            suffix = self.mem_limit[-1].lower()
+            if suffix in units.keys():
+                self.mem_limit = int(self.mem_limit[:-1]) * units[suffix]
+        # TODO: add swap limit support when it will be available in docker-py
+        # self.swap_limit = limits.get('swap')
+
         # Seed the service name, container name and host address as part of the
         # container's environment.
         self.env['MAESTRO_ENVIRONMENT_NAME'] = env_name
         self.env['SERVICE_NAME'] = self.service.name
         self.env['CONTAINER_NAME'] = self.name
         self.env['CONTAINER_HOST_ADDRESS'] = self.ship.ip
+
+        # With everything defined, build lifecycle state helpers as configured
+        self._lifecycle = self._parse_lifecycle(config.get('lifecycle', {}))
 
     @property
     def ship(self):
@@ -243,7 +322,7 @@ class Container(Entity):
         """Returns the ID of this container given by the Docker daemon, or None
         if the container doesn't exist."""
         status = self.status()
-        return status and status['ID'] or None
+        return status and status.get('ID', status.get('Id', None))
 
     def status(self, refresh=False):
         """Retrieve the details about this container from the Docker daemon, or
@@ -251,7 +330,7 @@ class Container(Entity):
         if refresh or not self._status:
             try:
                 self._status = self.ship.backend.inspect_container(self.name)
-            except docker.client.APIError:
+            except APIError:
                 pass
 
         return self._status
@@ -263,54 +342,34 @@ class Container(Entity):
         Variables are named
         '<service_name>_<container_name>_{HOST,PORT,INTERNAL_PORT}'.
         """
-        basename = re.sub(r'[^\w]',
-                          '_',
-                          '{}_{}'.format(self.service.name, self.name)).upper()
+        def _to_env_var_name(n):
+            return re.sub(r'[^\w]', '_', n).upper()
 
+        basename = _to_env_var_name(self.name)
         port_number = lambda p: p.split('/')[0]
 
         links = {'{}_HOST'.format(basename): self.ship.ip}
         for name, spec in self.ports.items():
-            links['{}_{}_PORT'.format(basename, name.upper())] = \
+            links['{}_{}_PORT'.format(basename, _to_env_var_name(name))] = \
                 port_number(spec['external'][1])
             if add_internal:
-                links['{}_{}_INTERNAL_PORT'.format(basename, name.upper())] = \
+                links['{}_{}_INTERNAL_PORT'.format(
+                    basename, _to_env_var_name(name))] = \
                     port_number(spec['exposed'])
         return links
 
-    def ping(self, retries=3):
-        """Check whether this container is alive or not. If the container
-        doesn't expose any ports, return the container status instead. If the
-        container exposes multiple ports, as soon as one port is active the
-        application inside the container is considered to be up and running.
+    def start_lifecycle_checks(self, state):
+        """Check if a particular lifecycle state has been reached by executing
+        all its defined checks. If not checks are defined, it is assumed the
+        state is reached immediately."""
 
-        Args:
-            retries (int): number of attempts (timeout is 1 second).
-        """
+        if state not in self._lifecycle:
+            # Return None to indicate no checks were performed.
+            return None
 
-        # No ports, return the last known container status.
-        if not self.ports:
-            status = self.status(refresh=True)
-            return status and status['State']['Running']
-
-        # Port(s) exposed, try to ping them 'retries' times.
-        while retries > 0:
-            # If the container is down, any service that should be inside for
-            # sure won't respond to port ping.
-            status = self.status(refresh=True)
-            if status and not status['State']['Running']:
-                return False
-
-            if filter(None, map(lambda port: self.ping_port(port),
-                                self.ports.iterkeys())):
-                return True
-
-            retries -= 1
-            if retries:
-                time.sleep(1)
-
-        # If we reach this point, the application is not running.
-        return False
+        pool = multiprocessing.pool.ThreadPool()
+        return pool.map_async(lambda check: check.test(),
+                              self._lifecycle[state])
 
     def ping_port(self, port):
         """Ping a single port, by its given name in the port mappings. Returns
@@ -320,14 +379,7 @@ class Container(Entity):
         if parts[1] == 'udp':
             return False
 
-        try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.settimeout(1)
-            s.connect((self.ship.ip, int(parts[0])))
-            s.close()
-            return True
-        except:
-            return False
+        return lifecycle.TCPPortPinger(self.ship.ip, int(parts[0])).test()
 
     def _parse_ports(self, ports):
         """Parse port mapping specifications for this container."""
@@ -364,7 +416,7 @@ class Container(Entity):
             # of the mapping optionally specifying the protocol.
             # External port is assumed to be bound on all interfaces as well.
             elif type(spec) == str:
-                parts = map(validate_proto, spec.split(':'))
+                parts = list(map(validate_proto, spec.split(':')))
                 if len(parts) == 1:
                     # If only one port number is provided, assumed external =
                     # exposed.
@@ -403,6 +455,15 @@ class Container(Entity):
                         spec, name, self))
 
         return result
+
+    def _parse_lifecycle(self, lifecycles):
+        """Parse the lifecycle checks configured for this container and
+        instantiate the corresponding check helpers, as configured."""
+        return dict([
+            (state, map(
+                lambda c: (lifecycle.LifecycleHelperFactory
+                           .from_config(self, c)),
+                checks)) for state, checks in lifecycles.items()])
 
     def __repr__(self):
         return '<container:%s/%s [on %s]>' % \

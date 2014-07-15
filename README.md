@@ -115,13 +115,22 @@ registries:
 The _ships_ are simple to define. They are named (but that name doesn't
 need to match their DNS resolvable host name), and need an `ip`
 address/hostname. If the Docker daemon doesn't listen its default port
-of 4243, the `docker_port` can be overriden:
+of 2375, the `docker_port` can be overriden. You can also use an SSH
+tunnel to secure the communication with the target Docker daemon
+(especially if you don't want to Docker daemon to listen on anything
+else than localhost, and rely on SSH key-based authentication instead).
 
 ```yaml
 ships:
-  vm1.ore1:   {ip: c414.ore1.domain.com}
-  vm2.ore2:   {ip: c415.ore1.domain.com, docker_port: 4244}
-  controller: {ip: 42.42.42.1}
+  vm1.ore1: {ip: c414.ore1.domain.com}
+  vm2.ore2: {ip: c415.ore2.domain.com, docker_port: 4243}
+  vm3.ore3:
+    ip: c416.ore3.domain.com
+    docker_port: 4243
+    ssh_tunnel:
+      user: ops
+      key: {{ env.HOME }}/.ssh/id_dsa
+      port: 22 # That's the default
 ```
 
 Services are also named. Their name is used for commands that act on
@@ -136,8 +145,16 @@ be placed on (by name). Additionally, it may define:
 
   - port mappings, as a map of `<port name>: <port or port mapping
     spec>` (see below for port spec syntax);
+  - lifecycle state checks, which Maestro uses to confirm a service
+    correctly started (see Lifecycle checks below);
   - volume mappings, as a map of `<destination in container>: <source from host>`;
-  - environment variables, as a map of `<variable name>: <value>`.
+  - environment variables, as a map of `<variable name>: <value>`;
+  - whether the container should run in privileged mode, as a boolean
+  `privileged: true | false` (Defaults to false);
+  - stop timeout: number of seconds to try to stop for before
+    killing the container (default is 10);
+  - memory limit;
+  - cpu shares (relative weight).
 
 ```yaml
 services:
@@ -147,13 +164,24 @@ services:
       zk-1:
         ship: vm1.ore1
         ports: {client: 2181, peer: 2888, leader_election: 3888}
+        lifecycle:
+          running: [{type: tcp, port: client}]
+        privileged: true
         volumes:
           /var/lib/zookeeper: /data/zookeeper
+        limits:
+          memory: 1g
+          cpu: 2
       zk-2:
         ship: vm2.ore1
         ports: {client: 2181, peer: 2888, leader_election: 3888}
+        lifecycle:
+          running: [{type: tcp, port: client}]
         volumes:
           /var/lib/zookeeper: /data/zookeeper
+        limits:
+          memory: 1g
+          cpu: 2
   kafka:
     image: kafka:latest
     requires: [ zookeeper ]
@@ -161,10 +189,71 @@ services:
       kafka-broker:
         ship: vm2.ore1
         ports: {broker: 9092}
+        lifecycle:
+          running: [{type: tcp, port: broker}]
         volumes:
           /var/lib/kafka: /data/kafka
         env:
           BROKER_ID: 0
+        stop_timeout: 2
+        limits:
+          memory: 5G
+          cpu: 10
+```
+
+Defining dependencies
+---------------------
+
+Services can depend on each other (circular dependencies are not
+supported though). This dependency tree instructs Maestro to start and
+stop the services in an order that will respect these dependencies.
+Dependent services are started before services that depend on them, and
+conversly leaves of the dependency tree are stopped before the services
+they depend on so that at no point in time a service may run without its
+dependencies -- unless this was forced by the user with the `-o` flag of
+course.
+
+Defining dependencies is done by giving a list of the dependent service
+names in the service block:
+
+```yaml
+services:
+  mysql:
+    image: mysql
+    instances:
+      mysql-server-1: { ... }
+
+  web:
+    image: nginx
+    requires: [ mysql ]
+    instances:
+      www-1: { ... }
+```
+
+Defining a dependency also makes Maestro inject into the instances of
+the service environment variables that describe where the instances of
+the service it depends on can be found (similarly to Docker links). See
+"How Maestro orchestrates" below for more details on these variables.
+
+It is also possible to define "soft" dependencies that do not impact the
+start/stop orders but that still make Maestro inject these variables.
+This can be useful if you know your application gracefully handles its
+dependencies not being present at start time, through reconnects and
+retries for examples. Defining soft dependencies is done via the
+`wants_info` entry:
+
+```yaml
+services:
+  mysql:
+    image: mysql
+    instances:
+      mysql-server-1: { ... }
+
+  web:
+    image: nginx
+    wants_info: [ mysql ]
+    instances:
+      www-1: { ... }
 ```
 
 Port mapping syntax
@@ -300,6 +389,55 @@ exposed through environment variables to other containers. This way, a
 dependent service can know the address of a remote service, and the
 specific port number of a desired endpoint. For example, service
 depending on ZooKeeper would be looking for its `client` port.
+
+Lifecycle checks
+----------------
+
+When controlling containers (your service instances), Maestro can
+perform additional checks to confirm that the service reached the
+desired lifecycle state, in addition to looking at the state of the
+container itself. A common use-case for example is to check for a given
+service port to become available to confirm that the application
+correctly started and is accepting connections.
+
+When starting containers, Maestro will execute all the lifecycle checks
+for the `running` target state; all must pass for the instance to be
+considered correctly up and running. Similarly, after stopping a
+container, Maestro will execute all `stopped` target state checks.
+
+Checks are defined via the `lifecycle` dictionary for each defined
+instance. The following checks are available: TCP port pinging, and
+script execution (using the return code). Keep in mind that if no
+`running` lifecycle checks are defined, Maestro considers the service up
+as soon as the container is up and will keep going with the
+orchestration play immediately.
+
+**TCP port pinging** makes Maestro attempt to connect to the configured
+port (by name), once per second until it succeeds or the `max_wait`
+value is reached (defaults to 60 seconds).
+
+Assuming your instance declares a `client` named port, you can make
+Maestro wait up to 10 seconds for this port to become available by doing
+the following:
+
+```yaml
+services:
+  zookeeper:
+    image: zookeeper:3.4.5
+    ports: {client: 2181}
+    lifecycle:
+      running:
+        - {type: tcp, port: client, max_wait: 10}
+```
+
+**Script execution** makes Maestro execute the given command, using the
+return code to denote the success or failure of the test (a return code
+of zero indicates success, as per the Unix convention). For example:
+
+```yaml
+type: exec
+command: "python my_cool_script.py"
+```
 
 How Maestro orchestrates and service auto-configuration
 -------------------------------------------------------

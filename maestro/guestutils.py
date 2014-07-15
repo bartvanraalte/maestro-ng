@@ -64,28 +64,43 @@ def get_port(name, default=None):
 def get_specific_host(service, container):
     """Return the hostname/address of a specific container/instance of the
     given service."""
-    return os.environ['{}_{}_HOST'.format(_to_env_var_name(service),
-                                          _to_env_var_name(container))]
+    try:
+        return os.environ['{}_{}_HOST'.format(_to_env_var_name(service),
+                                              _to_env_var_name(container))]
+    except:
+        raise MaestroEnvironmentError(
+            'No host defined for container {} of service {}'
+            .format(container, service))
 
 
 def get_specific_exposed_port(service, container, port, default=None):
     """Return the exposed (internal) port number of a specific port of a
     specific container from a given service."""
-    return int(os.environ.get(
-        '{}_{}_{}_INTERNAL_PORT'.format(_to_env_var_name(service),
-                                        _to_env_var_name(container),
-                                        _to_env_var_name(port)).upper(),
-        default))
+    try:
+        return int(os.environ.get(
+            '{}_{}_{}_INTERNAL_PORT'.format(_to_env_var_name(service),
+                                            _to_env_var_name(container),
+                                            _to_env_var_name(port)).upper(),
+            default))
+    except:
+        raise MaestroEnvironmentError(
+            'No internal port {} defined for container {} of service {}'
+            .format(port, container, service))
 
 
 def get_specific_port(service, container, port, default=None):
     """Return the external port number of a specific port of a specific
     container from a given service."""
-    return int(os.environ.get(
-        '{}_{}_{}_PORT'.format(_to_env_var_name(service),
-                               _to_env_var_name(container),
-                               _to_env_var_name(port)).upper(),
-        default))
+    try:
+        return int(os.environ.get(
+            '{}_{}_{}_PORT'.format(_to_env_var_name(service),
+                                   _to_env_var_name(container),
+                                   _to_env_var_name(port)).upper(),
+            default))
+    except:
+        raise MaestroEnvironmentError(
+            'No port {} defined for container {} of service {}'
+            .format(port, container, service))
 
 
 def get_node_list(service, ports=[], minimum=1):
@@ -116,7 +131,7 @@ def _to_env_var_name(s):
 
 def _get_service_instance_names(service):
     """Return the list of container/instance names for the given service."""
-    def extract_name(var):
-        m = re.match(r'^{}_(\w+)_HOST$'.format(_to_env_var_name(service)), var)
-        return m and m.group(1) or None
-    return filter(None, map(extract_name, sorted(os.environ.keys())))
+    key = '{}_INSTANCES'.format(_to_env_var_name(service))
+    if key not in os.environ:
+        return []
+    return os.environ[key].split(',')

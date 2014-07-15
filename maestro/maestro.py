@@ -2,9 +2,12 @@
 #
 # Docker container orchestration utility.
 
+from __future__ import print_function
+
 from . import entities
 from . import exceptions
 from . import plays
+from . import termoutput
 
 
 class Conductor:
@@ -24,12 +27,13 @@ class Conductor:
                 k, v['ip'],
                 docker_port=v.get('docker_port',
                                   entities.Ship.DEFAULT_DOCKER_PORT),
+                ssh_tunnel=v.get('ssh_tunnel'),
                 timeout=v.get('timeout')))
-            for k, v in self._config['ships'].iteritems())
+            for k, v in self._config['ships'].items())
 
         # Register defined private Docker registries authentications
-        self._registries = self._config.get('registries', {})
-        for name, registry in self._registries.iteritems():
+        self._registries = self._config.get('registries') or {}
+        for name, registry in self._registries.items():
             if 'username' not in registry or 'password' not in registry:
                 raise exceptions.OrchestrationException(
                     'Incomplete registry auth data for {}!'.format(name))
@@ -38,11 +42,11 @@ class Conductor:
         self._services = {}
         self._containers = {}
 
-        for kind, service in self._config['services'].iteritems():
+        for kind, service in self._config['services'].items():
             self._services[kind] = entities.Service(kind, service['image'],
                                                     service.get('env', {}))
 
-            for name, instance in service['instances'].iteritems():
+            for name, instance in service['instances'].items():
                 self._containers[name] = \
                     entities.Container(name,
                                        self._ships[instance['ship']],
@@ -51,30 +55,42 @@ class Conductor:
                                        self._config['name'])
 
         # Resolve dependencies between services.
-        for kind, service in self._config['services'].iteritems():
+        for kind, service in self._config['services'].items():
             for dependency in service.get('requires', []):
                 self._services[kind].add_dependency(self._services[dependency])
                 self._services[dependency].add_dependent(self._services[kind])
+            for wants_info in service.get('wants_info', []):
+                self._services[kind].add_wants_info(self._services[wants_info])
 
-        # Provide link environment variables to each container of each service.
-        for service in self._services.itervalues():
+        # Provide link environment variables to each container of each service
+        # that requires it or wants it.
+        for service in self._services.values():
             for container in service.containers:
                 # Containers always know about their peers in the same service.
                 container.env.update(service.get_link_variables(True))
                 # Containers also get links from the service's dependencies.
-                for dependency in service.requires:
+                for dependency in service.requires.union(service.wants_info):
                     container.env.update(dependency.get_link_variables())
+
+    @property
+    def registries(self):
+        """Returns the list of registries known to this conductor."""
+        return list(self._registries.keys())
 
     @property
     def services(self):
         """Returns the names of all the services defined in the environment."""
-        return self._services.keys()
+        return list(self._services.keys())
 
     @property
     def containers(self):
         """Returns the names of all the containers defined in the
         environment."""
-        return self._containers.keys()
+        return list(self._containers.keys())
+
+    def get_registry(self, name):
+        """Returns a registry, by name."""
+        return self._registries[name]
 
     def get_service(self, name):
         """Returns a service, by name."""
@@ -145,6 +161,18 @@ class Conductor:
                 '{} is neither a service nor a container!'.format(s))
         return reduce(lambda x, y: x+y, map(parse_thing, things), [])
 
+    def _to_services(self, things):
+        """Transform a list of "things", container names or service names, to a
+        list of Service objects with no duplicates."""
+        def parse_thing(s):
+            if s in self._containers:
+                return self._containers[s].service
+            if s in self._services:
+                return self._services[s]
+            raise exceptions.OrchestrationException(
+                '{} is neither a service nor a container!'.format(s))
+        return list(set(map(parse_thing, things)))
+
     def _ordered_containers(self, things, forward=True):
         """Return the ordered list of containers from the list of names passed
         to it (either container names or service names).
@@ -199,6 +227,22 @@ class Conductor:
             if not only else self._to_containers(things)
         plays.Start(containers, self._registries, refresh_images).run()
 
+    def restart(self, things=[], refresh_images=False, only=False, **kwargs):
+        """Restart the given container(s) and services(s). Dependencies of the
+        requested containers and services are started first.
+
+        Args:
+            things (set<string>): The list of things to start.
+            refresh_images (boolean): Whether to force an image pull for each
+                container or not before starting it.
+            only (boolean): Whether to act on only the specified things, or
+                their dependencies as well.
+        """
+        containers = self._ordered_containers(things, False) \
+            if not only else self._to_containers(things)
+        plays.Stop(containers).run()
+        plays.Start(containers, self._registries, refresh_images).run()
+
     def stop(self, things=[], only=False, **kwargs):
         """Stop the given container(s) and service(s).
 
@@ -216,9 +260,6 @@ class Conductor:
             if not only else self._to_containers(things)
         plays.Stop(containers).run()
 
-    def clean(self, **kwargs):
-        raise NotImplementedError('Not yet implemented!')
-
     def logs(self, things=[], **kwargs):
         """Display the logs of the given container."""
         containers = self._to_containers(things)
@@ -228,7 +269,7 @@ class Conductor:
 
         container = containers[0]
 
-        o = plays.OutputFormatter()
+        o = termoutput.OutputFormatter()
         o.pending('Inspecting container status...')
         status = container.status()
         if not status:
@@ -241,14 +282,37 @@ class Conductor:
                     'Now streaming logs for {}. New output will appear below.'
                     .format(container.name))
                 logs = container.ship.backend.attach(container.id, stream=True)
-                for line in logs:
-                    print(line.rstrip())
             else:
                 o.pending(
                     'Requesting logs for {}. This may take a while...'
                     .format(container.name))
                 logs = container.ship.backend.logs(container.id).split('\n')
                 logs = logs[-int(kwargs.get('n', len(logs))):]
-                print('\n'.join(logs))
+
+            o.pending('\033[2K')
+            for line in logs:
+                print(line.rstrip())
         except:
             pass
+
+    def deptree(self, things=[], **kwargs):
+        """Display the dependency tree of the given services."""
+        only = kwargs['only']
+
+        def treehelper(service, indent, shown):
+            deps = sorted(service.dependencies.difference(shown)) \
+                if only else sorted(service.dependencies)
+            shown.update(deps)
+            for i, dep in enumerate(deps, 1):
+                last = i == len(deps)
+                print('{}{} {}'.format(indent,
+                                       last and '\\-' or '+-',
+                                       dep.name))
+                treehelper(dep, indent + (last and '  ' or '|  '), shown)
+
+        services = self._to_services(things or sorted(self._services))
+        for i, service in enumerate(services, 1):
+            print(service.name)
+            treehelper(service, ' ', set([]))
+            if i < len(services):
+                print()

@@ -4,39 +4,50 @@
 #
 # Docker container orchestration utility.
 
+from __future__ import print_function
+
 import argparse
+import jinja2
 import logging
 import sys
 import os
-
 import yaml
-from jinja2 import Template
 
 from . import exceptions, maestro
+from . import name, version
 
 # Define the commands
-ACCEPTED_COMMANDS = ['status', 'fullstatus', 'start', 'stop', 'clean', 'logs']
+ACCEPTED_COMMANDS = ['status', 'fullstatus', 'start', 'stop', 'restart',
+                     'logs', 'deptree']
+DEFAULT_MAESTRO_FILE = 'maestro.yaml'
 
 
 def load_config(options):
-    with (options.file == '-' and sys.stdin or open(options.file)) as f:
-        raw_config = f.read()
+    """Preprocess the input config file through Jinja2 before loading it as
+    JSON."""
+    if options.file == '-':
+        template = jinja2.Template(sys.stdin.read())
+    else:
+        env = jinja2.Environment(
+            loader=jinja2.FileSystemLoader(os.path.dirname(options.file)),
+            extensions=['jinja2.ext.with_'])
+        template = env.get_template(os.path.basename(options.file))
 
-        # Preprocess the config file with Jinja2
-        return yaml.load(Template(raw_config).render(env=os.environ))
+    return yaml.load(template.render(env=os.environ))
 
 
 def create_parser():
-    parser = argparse.ArgumentParser(
-        prog='maestro',
-        description='Docker container orchestrator.')
+    parser = argparse.ArgumentParser(prog=name, description=(
+        '{} v{}, Docker container orchestrator.'.format(
+            name.title(), version)))
     parser.add_argument('command', nargs='?',
                         choices=ACCEPTED_COMMANDS,
                         default='status',
                         help='orchestration command to execute')
     parser.add_argument('things', nargs='*', metavar='thing',
                         help='container(s) or service(s) to act on')
-    parser.add_argument('-f', '--file', nargs='?', default='-', metavar='FILE',
+    parser.add_argument('-f', '--file', nargs='?', metavar='FILE',
+                        default=DEFAULT_MAESTRO_FILE,
                         help=('read environment description from FILE ' +
                               '(use - for stdin)'))
     parser.add_argument('-c', '--completion', metavar='CMD',
@@ -53,13 +64,25 @@ def create_parser():
     parser.add_argument('-o', '--only', action='store_const',
                         const=True, default=False,
                         help='only affect the selected container or service')
-
+    parser.add_argument('-v', '--version', action='version',
+                        version='{}-{}'.format(name, version),
+                        help='show program version and exit')
     return parser
 
 
-def main(args):
+def main(args=None):
     options = create_parser().parse_args(args)
-    config = load_config(options)
+
+    try:
+        config = load_config(options)
+    except jinja2.exceptions.TemplateNotFound:
+        logging.error('Environment description file %s not found!',
+                      options.file)
+        sys.exit(1)
+    except:
+        logging.error('Error reading environment description file %s!',
+                      options.file)
+        sys.exit(1)
 
     # Shutup urllib3, wherever it comes from.
     (logging.getLogger('requests.packages.urllib3.connectionpool')
@@ -92,5 +115,6 @@ def main(args):
     except KeyboardInterrupt:
         return 1
 
+
 if __name__ == '__main__':
-    sys.exit(main(sys.argv[1:]))
+    sys.exit(main())
